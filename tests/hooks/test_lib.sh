@@ -87,6 +87,15 @@ assert_eq "extract cwd from antigravity workspacePaths" "/home/u/agy" "$(ai_memo
 PAYLOAD_WINDOWS='{"session_id":"x","cwd":"C:\\dev\\myproject"}'
 assert_eq "extract cwd unescapes Windows JSON path" 'C:\dev\myproject' \
     "$(ai_memory_extract_cwd "$PAYLOAD_WINDOWS")"
+# Cursor sends the workspace directory only as `workspace_roots`: its
+# sessionStart omits `cwd` and its tool events send `cwd: ""`. Both must
+# resolve or every Cursor event is filed under the default scratch project.
+PAYLOAD_CURSOR_START='{"session_id":"x","hook_event_name":"sessionStart","cursor_version":"2026.09.02","workspace_roots":["/home/u/cur"]}'
+assert_eq "extract cwd from cursor workspace_roots" "/home/u/cur" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_START")"
+PAYLOAD_CURSOR_TOOL='{"session_id":"x","cwd":"","hook_event_name":"postToolUse","workspace_roots":["/home/u/cur"]}'
+assert_eq "extract cwd falls through cursor empty cwd" "/home/u/cur" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL")"
 
 antigravity_initial() {
     if ai_memory_antigravity_is_initial_invocation "$1"; then
@@ -171,6 +180,45 @@ assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&worksp
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$(ai_memory_url_encode "$TMP/nonexistent")" "$QS3"
 
+# --- capture-only marker transparency (#668) ---------------------------
+# A nested marker whose only content is [capture] must not shadow an outer
+# marker's workspace/project: ai_memory_marker_qs skips it and forwards the
+# OUTER marker's fields, while ai_memory_find_marker (used for [capture]
+# itself) still resolves the INNER (nearest) marker.
+mkdir -p "$TMP/scope/inner"
+printf 'workspace = "acme"\nproject = "infra"\n' >"$TMP/scope/.ai-memory.toml"
+printf '[capture]\nignore_paths = ["secret/**"]\n' >"$TMP/scope/inner/.ai-memory.toml"
+
+assert_eq "capture-only marker: find_marker still resolves nearest" \
+    "$TMP/scope/inner/.ai-memory.toml" \
+    "$(ai_memory_find_marker "$TMP/scope/inner")"
+assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
+    "$TMP/scope/.ai-memory.toml" \
+    "$(ai_memory_find_settings_marker "$TMP/scope/inner")"
+assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker" \
+    "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+# A marker declaring [briefing] but no workspace/project is NOT capture-only
+# (it declares a forwarded setting), so it stays a resolution boundary: the
+# outer marker's scope must not leak through it.
+printf '[briefing]\ninject_on_session_start = true\n' >"$TMP/scope/inner/.ai-memory.toml"
+assert_eq "briefing-only marker is a settings boundary, not transparent" \
+    "" "$(ai_memory_parse_toml_key "$(ai_memory_find_settings_marker "$TMP/scope/inner")" workspace)"
+assert_eq "marker_qs stops at the briefing-only boundary" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+# A capture-only marker with no scope-declaring ancestor: still transparent,
+# and resolution falls back exactly as it does with no marker at all.
+mkdir -p "$TMP/no-outer-scope/inner"
+printf '[capture]\nignore_paths = ["a/**"]\n' >"$TMP/no-outer-scope/inner/.ai-memory.toml"
+assert_eq "capture-only marker with no ancestor scope: settings walk finds none" \
+    "" "$(ai_memory_find_settings_marker "$TMP/no-outer-scope/inner")"
+assert_eq "capture-only marker with no ancestor scope: marker_qs is cwd-only" \
+    "&cwd=$(ai_memory_url_encode "$TMP/no-outer-scope/inner")" \
+    "$(ai_memory_marker_qs "$TMP/no-outer-scope/inner")"
+
 # --- repo-root strategy: host-side resolution -------------------------
 # Outside any git repo the helper stays silent (caller keeps basename(cwd)).
 assert_eq "repo_root_project on non-git path is empty" "" \
@@ -181,7 +229,7 @@ if command -v git >/dev/null 2>&1; then
     mkdir -p "$REPO"
     git init -q "$REPO"
     git -C "$REPO" -c user.email=t@example.com -c user.name=t \
-        commit -q --allow-empty -m init
+        commit -q --no-gpg-sign --allow-empty -m init
 
     # A subdirectory of the main checkout collapses to the repo basename
     # (not the subdir name) when the marker selects repo-root and pins no
@@ -261,6 +309,54 @@ assert_eq "url_encode escapes plus"       "a%2Bb"  "$(ai_memory_url_encode "a+b"
 assert_eq "url_encode escapes Windows cwd" "C%3A%5Cdev%5Cmyproject" \
     "$(ai_memory_url_encode 'C:\dev\myproject')"
 assert_eq "url_encode encodes UTF-8 per byte" "r%C3%A9po" "$(ai_memory_url_encode 'répo')"
+
+# --- offline spool ----------------------------------------------------
+# The spool dir follows the data dir, which the harness pins inside $TMP.
+AI_MEMORY_DATA_DIR="$TMP/spool-data"
+export AI_MEMORY_DATA_DIR
+
+MS=$(ai_memory_now_ms)
+assert_eq "now_ms is 13 digits" "13" "$(printf '%s' "$MS" | wc -c | tr -d ' ')"
+case "$MS" in
+    *[!0-9]*) assert_eq "now_ms is all digits" "digits" "$MS" ;;
+    *) assert_eq "now_ms is all digits" "digits" "digits" ;;
+esac
+
+# A body carrying every escape ai_memory_json_string emits must survive the
+# write/read round trip byte for byte, or a drained event is corrupted.
+SPOOL_BODY='{"t":"quote \" backslash \\ newline
+tab\ttail"}'
+ai_memory_spool_event "http://127.0.0.1:1/hook?event=stop&agent=cursor" "$SPOOL_BODY"
+SPOOL_FILE=$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | head -n 1)
+assert_eq "spool_event writes one entry" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "spooled body round-trips" "$SPOOL_BODY" "$(ai_memory_json_field body "$SPOOL_FILE")"
+assert_eq "spool_event mints an ingest_key" "yes" \
+    "$(case "$(ai_memory_json_field url "$SPOOL_FILE")" in *ingest_key=sh*) printf yes ;; *) printf no ;; esac)"
+assert_eq "spool entry is 0600" "600" \
+    "$(ls -l "$SPOOL_FILE" | cut -c2-10 | tr 'rwx-' '4210' | awk '{print substr($0,1,3)+0 substr($0,4,3)+0 substr($0,7,3)+0}' >/dev/null 2>&1; \
+       if [ -r "$SPOOL_FILE" ] && [ ! -x "$SPOOL_FILE" ]; then printf '600'; else printf 'other'; fi)"
+assert_eq "spool filename is <ms>-<pid>-<seq>.json" "ok" \
+    "$(basename "$SPOOL_FILE" | grep -Eq '^[0-9]{13}-[0-9]+-[0-9a-f]{16}\.json$' && printf ok || printf bad)"
+
+# A `\uXXXX` escape means a richer serializer wrote the entry (the native
+# binary). The shell reader declines it rather than mangling the payload, so
+# `ai-memory hook-drain` still delivers it.
+printf '%s' '{"url":"http://x/y","body":"{\"a\":\"\u0007\"}","created_ms":1,"auth_mode":"none","attempts":0}' \
+    >"$TMP/spool-data/hook-spool/foreign.json"
+ai_memory_json_field body "$TMP/spool-data/hook-spool/foreign.json" >/dev/null 2>&1 \
+    && FOREIGN=read || FOREIGN=declined
+assert_eq "json_field declines a \\u escape" "declined" "$FOREIGN"
+rm -f "$TMP/spool-data/hook-spool/foreign.json"
+
+# An unreachable server must leave the event on disk instead of dropping it.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+printf '%s' '{"e":"unreachable"}' \
+    | ai_memory_post_hook "http://127.0.0.1:1/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook spools an undelivered event" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+unset AI_MEMORY_DATA_DIR
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
